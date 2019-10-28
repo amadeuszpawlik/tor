@@ -2201,6 +2201,31 @@ circuit_reset_failure_count(int timeout)
   n_circuit_failures = 0;
 }
 
+/** Check if we can use requested exit node. Returns 1 if requested node is
+ * usable, 0 if not usable but we may try other alternatives, and -1 if not
+ * usable and we may not try other alternatives.
+ */
+static int check_if_we_can_use_exit(entry_connection_t *conn) {
+  const node_t *node = node_get_by_nickname(conn->chosen_exit_name, 0);
+  int opt = conn->chosen_exit_optional;
+  if (node && !connection_ap_can_use_exit(conn, node)) {
+    log_fn(opt ? LOG_INFO : LOG_WARN, LD_APP,
+           "Requested exit point '%s' is excluded or "
+           "would refuse request. %s.",
+           conn->chosen_exit_name, opt ? "Trying others" : "Closing");
+
+    /* Try others */
+    if (opt) {
+      /* If we are allowed to ignore the .exit request, do so */
+      conn->chosen_exit_optional = 0;
+      tor_free(conn->chosen_exit_name);
+      return 0;
+    }
+    return -1;
+  }
+  return 1;
+}
+
 /** Find an open circ that we're happy to use for <b>conn</b> and return 1. If
  * there isn't one, and there isn't one on the way, launch one and return
  * 0. If it will never work, return -1.
@@ -2331,25 +2356,16 @@ circuit_get_open_circ_or_launch(entry_connection_t *conn,
         return -1;
       }
     } else {
-      /* XXXX Duplicates checks in connection_ap_handshake_attach_circuit:
-       * refactor into a single function. */
-      const node_t *node = node_get_by_nickname(conn->chosen_exit_name, 0);
-      int opt = conn->chosen_exit_optional;
-      if (node && !connection_ap_can_use_exit(conn, node)) {
-        log_fn(opt ? LOG_INFO : LOG_WARN, LD_APP,
-               "Requested exit point '%s' is excluded or "
-               "would refuse request. %s.",
-               conn->chosen_exit_name, opt ? "Trying others" : "Closing");
-        if (opt) {
-          conn->chosen_exit_optional = 0;
-          tor_free(conn->chosen_exit_name);
-          /* Try again. */
-          return circuit_get_open_circ_or_launch(conn,
-                                                 desired_circuit_purpose,
-                                                 circp);
-        }
-        return -1;
-      }
+      int usableexit = check_if_we_can_use_exit(conn);
+      if(usableexit == 0)
+        /* Node disallowed, but we're allowed to try others */
+        return circuit_get_open_circ_or_launch(conn,
+                                               desired_circuit_purpose,
+                                               circp);
+
+      if(usableexit == -1)
+        /* Node disallowed, exit */
+        return usableexit;
     }
   }
 
@@ -2865,29 +2881,21 @@ connection_ap_handshake_attach_circuit(entry_connection_t *conn)
      * open to that exit. See what exit we meant, and whether we can use it.
      */
     if (conn->chosen_exit_name) {
-      const node_t *node = node_get_by_nickname(conn->chosen_exit_name, 0);
-      int opt = conn->chosen_exit_optional;
-      if (!node && !want_onehop) {
+      int usableexit = check_if_we_can_use_exit(conn);
+
+      if (usableexit != -2)
+        return usableexit;
+
+      /* Exit point unknown, can we ignore it? */
+      if (!want_onehop) {
         /* We ran into this warning when trying to extend a circuit to a
          * hidden service directory for which we didn't have a router
          * descriptor. See flyspray task 767 for more details. We should
          * keep this in mind when deciding to use BEGIN_DIR cells for other
          * directory requests as well. -KL*/
+        int opt = conn->chosen_exit_optional;
         log_fn(opt ? LOG_INFO : LOG_WARN, LD_APP,
                "Requested exit point '%s' is not known. %s.",
-               conn->chosen_exit_name, opt ? "Trying others" : "Closing");
-        if (opt) {
-          /* If we are allowed to ignore the .exit request, do so */
-          conn->chosen_exit_optional = 0;
-          tor_free(conn->chosen_exit_name);
-          return 0;
-        }
-        return -1;
-      }
-      if (node && !connection_ap_can_use_exit(conn, node)) {
-        log_fn(opt ? LOG_INFO : LOG_WARN, LD_APP,
-               "Requested exit point '%s' is excluded or "
-               "would refuse request. %s.",
                conn->chosen_exit_name, opt ? "Trying others" : "Closing");
         if (opt) {
           /* If we are allowed to ignore the .exit request, do so */
