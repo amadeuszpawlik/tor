@@ -56,6 +56,11 @@ int connection_ap_handshake_attach_chosen_circuit(entry_connection_t *conn,
                                                   origin_circuit_t *circ,
                                                   crypt_path_t *cpath);
 int connection_ap_handshake_attach_circuit(entry_connection_t *conn);
+int connection_ap_handshake_attach_general(entry_connection_t *conn,
+                                           connection_t *base_conn,
+                                           int conn_age);
+int connection_ap_handshake_attach_rendezvous(entry_connection_t *conn,
+                                              int conn_age);
 
 void circuit_change_purpose(circuit_t *circ, uint8_t new_purpose);
 

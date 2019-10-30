@@ -2818,26 +2818,254 @@ connection_ap_get_nonrend_circ_purpose(const entry_connection_t *conn)
   return CIRCUIT_PURPOSE_C_GENERAL;
 }
 
+/** Try to find and attach a general circuit. Returns as
+ * connection_ap_handshake_attach_circuit().)
+ */
+int
+connection_ap_handshake_attach_general(entry_connection_t *conn, connection_t
+    *base_conn, int conn_age)
+{
+  int retval;
+  int want_onehop;
+
+  tor_assert(conn);
+  origin_circuit_t *circ = NULL;
+  want_onehop = conn->want_onehop;
+
+  /* Are we linked to a dir conn that aims to fetch a consensus?
+   * We check here because the conn might no longer be needed. */
+  if (base_conn->linked_conn &&
+      base_conn->linked_conn->type == CONN_TYPE_DIR &&
+      base_conn->linked_conn->purpose == DIR_PURPOSE_FETCH_CONSENSUS) {
+
+    /* Yes we are. Is there a consensus fetch farther along than us? */
+    if (networkstatus_consensus_is_already_downloading(
+          TO_DIR_CONN(base_conn->linked_conn)->requested_resource)) {
+      /* We're doing the "multiple consensus fetch attempts" game from
+       * proposal 210, and we're late to the party. Just close this conn.
+       * The circuit and TLS conn that we made will time out after a while
+       * if nothing else wants to use them. */
+      log_info(LD_DIR, "Closing extra consensus fetch (to %s) since one "
+               "is already downloading.", base_conn->linked_conn->address);
+      return -1;
+    }
+  }
+
+  /* If we have a chosen exit, we need to use a circuit that's
+   * open to that exit. See what exit we meant, and whether we can use it.
+   */
+  if (conn->chosen_exit_name) {
+    int usableexit = check_if_we_can_use_exit(conn);
+
+    if (usableexit == 0)
+      return usableexit; /* Exit disallowed*/
+
+    if (usableexit == -1){
+      /* Can it be that the node doesn't exist? */
+      const node_t *node = node_get_by_nickname(conn->chosen_exit_name, 0);
+      if(!node && !want_onehop) {
+        /* We ran into this warning when trying to extend a circuit to a
+         * hidden service directory for which we didn't have a router
+         * descriptor. See flyspray task 767 for more details. We should
+         * keep this in mind when deciding to use BEGIN_DIR cells for other
+         * directory requests as well. -KL*/
+          int opt = conn->chosen_exit_optional;
+          log_fn(opt ? LOG_INFO : LOG_WARN, LD_APP,
+                 "Requested exit point '%s' is not known. %s.",
+                 conn->chosen_exit_name, opt ? "Trying others" : "Closing");
+          if (opt) {
+            /* If we are allowed to ignore the .exit request, do so */
+            conn->chosen_exit_optional = 0;
+            tor_free(conn->chosen_exit_name);
+            return 0;
+          }
+        }
+      /* Exit point unknown and we're not allowed to try other exits */
+      return -1;
+    }
+  }
+
+  /* Find the circuit that we should use, if there is one. Otherwise
+   * launch it
+   */
+  retval = circuit_get_open_circ_or_launch(conn,
+          connection_ap_get_nonrend_circ_purpose(conn),
+          &circ);
+
+  if (retval < 1) {
+    /* We were either told "-1" (complete failure) or 0 (circuit in
+     * progress); we can't attach this stream yet. */
+    return retval;
+  }
+
+  log_debug(LD_APP|LD_CIRC,
+            "Attaching apconn to circ %u (stream %d sec old).",
+            (unsigned)circ->base_.n_circ_id, conn_age);
+  /* print the circ's path, so clients can figure out which circs are
+   * sucking. */
+  circuit_log_path(LOG_INFO,LD_APP|LD_CIRC,circ);
+
+  /* We have found a suitable circuit for our conn. Hurray.  Do
+   * the attachment. */
+  return connection_ap_handshake_attach_chosen_circuit(conn, circ, NULL);
+}
+
+/** Try to find and attach a rendezvous circuit. Returns as
+ * connection_ap_handshake_attach_circuit().)
+ */
+int
+connection_ap_handshake_attach_rendezvous(entry_connection_t *conn,
+    int conn_age)
+{
+  int retval;
+  origin_circuit_t *rendcirc=NULL, *introcirc=NULL;
+
+  tor_assert(conn);
+  tor_assert(!ENTRY_TO_EDGE_CONN(conn)->cpath_layer);
+
+  /* start by finding a rendezvous circuit for us */
+  retval = circuit_get_open_circ_or_launch(
+     conn, CIRCUIT_PURPOSE_C_REND_JOINED, &rendcirc);
+  if (retval < 0) return -1; /* failed */
+
+  if (retval > 0) {
+    tor_assert(rendcirc);
+    /* one is already established, attach */
+    log_info(LD_REND,
+             "rend joined circ %u (id: %" PRIu32 ") already here. "
+             "Attaching. (stream %d sec old)",
+             (unsigned) TO_CIRCUIT(rendcirc)->n_circ_id,
+             rendcirc->global_identifier, conn_age);
+    /* Mark rendezvous circuits as 'newly dirty' every time you use
+     * them, since the process of rebuilding a rendezvous circ is so
+     * expensive. There is a tradeoff between linkability and
+     * feasibility, at this point.
+     */
+    rendcirc->base_.timestamp_dirty = time(NULL);
+
+    /* We've also attempted to use them. If they fail, we need to
+     * probe them for path bias */
+    pathbias_count_use_attempt(rendcirc);
+
+    link_apconn_to_circ(conn, rendcirc, NULL);
+    if (connection_ap_handshake_send_begin(conn) < 0)
+      return 0; /* already marked, let them fade away */
+    return 1;
+  }
+
+  /* At this point we need to re-check the state, since it's possible that
+   * our call to circuit_get_open_circ_or_launch() changed the connection's
+   * state from "CIRCUIT_WAIT" to "RENDDESC_WAIT" because we decided to
+   * re-fetch the descriptor.
+   */
+  if (ENTRY_TO_CONN(conn)->state != AP_CONN_STATE_CIRCUIT_WAIT) {
+    log_info(LD_REND, "This connection is no longer ready to attach; its "
+             "state changed."
+             "(We probably have to re-fetch its descriptor.)");
+    return 0;
+  }
+
+  if (rendcirc && (rendcirc->base_.purpose ==
+                   CIRCUIT_PURPOSE_C_REND_READY_INTRO_ACKED)) {
+    log_info(LD_REND,
+             "pending-join circ %u (id: %" PRIu32 ") already here, with "
+             "intro ack. Stalling. (stream %d sec old)",
+             (unsigned) TO_CIRCUIT(rendcirc)->n_circ_id,
+             rendcirc->global_identifier, conn_age);
+    return 0;
+  }
+
+  /* it's on its way. find an intro circ. */
+  retval = circuit_get_open_circ_or_launch(
+    conn, CIRCUIT_PURPOSE_C_INTRODUCE_ACK_WAIT, &introcirc);
+  if (retval < 0) return -1; /* failed */
+
+  if (retval > 0) {
+    /* one has already sent the intro. keep waiting. */
+    tor_assert(introcirc);
+    log_info(LD_REND, "Intro circ %u (id: %" PRIu32 ") present and "
+                      "awaiting ACK. Rend circuit %u (id: %" PRIu32 "). "
+                      "Stalling. (stream %d sec old)",
+             (unsigned) TO_CIRCUIT(introcirc)->n_circ_id,
+             introcirc->global_identifier,
+             rendcirc ? (unsigned) TO_CIRCUIT(rendcirc)->n_circ_id : 0,
+             rendcirc ? rendcirc->global_identifier : 0,
+             conn_age);
+    return 0;
+  }
+
+  /* now rendcirc and introcirc are each either undefined or not finished */
+
+  if (rendcirc && introcirc &&
+      rendcirc->base_.purpose == CIRCUIT_PURPOSE_C_REND_READY) {
+    log_info(LD_REND,
+             "ready rend circ %u (id: %" PRIu32 ") already here. No"
+             "intro-ack yet on intro %u (id: %" PRIu32 "). "
+             "(stream %d sec old)",
+             (unsigned) TO_CIRCUIT(rendcirc)->n_circ_id,
+             rendcirc->global_identifier,
+             (unsigned) TO_CIRCUIT(introcirc)->n_circ_id,
+             introcirc->global_identifier, conn_age);
+
+    tor_assert(introcirc->base_.purpose == CIRCUIT_PURPOSE_C_INTRODUCING);
+    if (introcirc->base_.state == CIRCUIT_STATE_OPEN) {
+      int ret;
+      log_info(LD_REND, "Found open intro circ %u (id: %" PRIu32 "). "
+                        "Rend circuit %u (id: %" PRIu32 "); Sending "
+                        "introduction. (stream %d sec old)",
+               (unsigned) TO_CIRCUIT(introcirc)->n_circ_id,
+               introcirc->global_identifier,
+               (unsigned) TO_CIRCUIT(rendcirc)->n_circ_id,
+               rendcirc->global_identifier, conn_age);
+      ret = hs_client_send_introduce1(introcirc, rendcirc);
+      switch (ret) {
+      case 0: /* success */
+        rendcirc->base_.timestamp_dirty = time(NULL);
+        introcirc->base_.timestamp_dirty = time(NULL);
+
+        pathbias_count_use_attempt(introcirc);
+        pathbias_count_use_attempt(rendcirc);
+
+        assert_circuit_ok(TO_CIRCUIT(rendcirc));
+        assert_circuit_ok(TO_CIRCUIT(introcirc));
+        return 0;
+      case -1: /* transient error */
+        return 0;
+      case -2: /* permanent error */
+        return -1;
+      default: /* oops */
+        tor_fragile_assert();
+        return -1;
+      }
+    }
+  }
+
+  log_info(LD_REND, "Intro %u (id: %" PRIu32 ") and rend circuit %u "
+                    "(id: %" PRIu32 ") circuits are not both ready. "
+                    "Stalling conn. (%d sec old)",
+           introcirc ? (unsigned) TO_CIRCUIT(introcirc)->n_circ_id : 0,
+           introcirc ? introcirc->global_identifier : 0,
+           rendcirc ? (unsigned) TO_CIRCUIT(rendcirc)->n_circ_id : 0,
+           rendcirc ? rendcirc->global_identifier : 0, conn_age);
+  return 0;
+}
+
 /** Try to find a safe live circuit for stream <b>conn</b>.  If we find one,
  * attach the stream, send appropriate cells, and return 1.  Otherwise,
  * try to launch new circuit(s) for the stream.  If we can launch
  * circuits, return 0.  Otherwise, if we simply can't proceed with
  * this stream, return -1. (conn needs to die, and is maybe already marked).
  */
-/* XXXX this function should mark for close whenever it returns -1;
- * its callers shouldn't have to worry about that. */
 int
 connection_ap_handshake_attach_circuit(entry_connection_t *conn)
 {
   connection_t *base_conn = ENTRY_TO_CONN(conn);
-  int retval;
   int conn_age;
-  int want_onehop;
+  int retval;
 
   tor_assert(conn);
   tor_assert(base_conn->state == AP_CONN_STATE_CIRCUIT_WAIT);
   tor_assert(conn->socks_request);
-  want_onehop = conn->want_onehop;
 
   conn_age = (int)(time(NULL) - base_conn->timestamp_created);
 
@@ -2852,217 +3080,19 @@ connection_ap_handshake_attach_circuit(entry_connection_t *conn)
     return -1;
   }
 
-  /* We handle "general" (non-onion) connections much more straightforwardly.
+  /* Check if it's a rendezvouz or general connection, try to attach
+   * accordingly.
    */
-  if (!connection_edge_is_rendezvous_stream(ENTRY_TO_EDGE_CONN(conn))) {
-    /* we're a general conn */
-    origin_circuit_t *circ=NULL;
+  if (!connection_edge_is_rendezvous_stream(ENTRY_TO_EDGE_CONN(conn)))
+    retval = connection_ap_handshake_attach_general(conn, base_conn,
+        conn_age);
+  else
+    retval = connection_ap_handshake_attach_rendezvous(conn, conn_age);
 
-    /* Are we linked to a dir conn that aims to fetch a consensus?
-     * We check here because the conn might no longer be needed. */
-    if (base_conn->linked_conn &&
-        base_conn->linked_conn->type == CONN_TYPE_DIR &&
-        base_conn->linked_conn->purpose == DIR_PURPOSE_FETCH_CONSENSUS) {
-
-      /* Yes we are. Is there a consensus fetch farther along than us? */
-      if (networkstatus_consensus_is_already_downloading(
-            TO_DIR_CONN(base_conn->linked_conn)->requested_resource)) {
-        /* We're doing the "multiple consensus fetch attempts" game from
-         * proposal 210, and we're late to the party. Just close this conn.
-         * The circuit and TLS conn that we made will time out after a while
-         * if nothing else wants to use them. */
-        log_info(LD_DIR, "Closing extra consensus fetch (to %s) since one "
-                 "is already downloading.", base_conn->linked_conn->address);
-        return -1;
-      }
-    }
-
-    /* If we have a chosen exit, we need to use a circuit that's
-     * open to that exit. See what exit we meant, and whether we can use it.
-     */
-    if (conn->chosen_exit_name) {
-      int usableexit = check_if_we_can_use_exit(conn);
-
-      if (usableexit != -2)
-        return usableexit;
-
-      /* Exit point unknown, can we ignore it? */
-      if (!want_onehop) {
-        /* We ran into this warning when trying to extend a circuit to a
-         * hidden service directory for which we didn't have a router
-         * descriptor. See flyspray task 767 for more details. We should
-         * keep this in mind when deciding to use BEGIN_DIR cells for other
-         * directory requests as well. -KL*/
-        int opt = conn->chosen_exit_optional;
-        log_fn(opt ? LOG_INFO : LOG_WARN, LD_APP,
-               "Requested exit point '%s' is not known. %s.",
-               conn->chosen_exit_name, opt ? "Trying others" : "Closing");
-        if (opt) {
-          /* If we are allowed to ignore the .exit request, do so */
-          conn->chosen_exit_optional = 0;
-          tor_free(conn->chosen_exit_name);
-          return 0;
-        }
-        return -1;
-      }
-    }
-
-    /* Find the circuit that we should use, if there is one. Otherwise
-     * launch it
-     */
-    retval = circuit_get_open_circ_or_launch(conn,
-            connection_ap_get_nonrend_circ_purpose(conn),
-            &circ);
-
-    if (retval < 1) {
-      /* We were either told "-1" (complete failure) or 0 (circuit in
-       * progress); we can't attach this stream yet. */
-      return retval;
-    }
-
-    log_debug(LD_APP|LD_CIRC,
-              "Attaching apconn to circ %u (stream %d sec old).",
-              (unsigned)circ->base_.n_circ_id, conn_age);
-    /* print the circ's path, so clients can figure out which circs are
-     * sucking. */
-    circuit_log_path(LOG_INFO,LD_APP|LD_CIRC,circ);
-
-    /* We have found a suitable circuit for our conn. Hurray.  Do
-     * the attachment. */
-    return connection_ap_handshake_attach_chosen_circuit(conn, circ, NULL);
-
-  } else { /* we're a rendezvous conn */
-    origin_circuit_t *rendcirc=NULL, *introcirc=NULL;
-
-    tor_assert(!ENTRY_TO_EDGE_CONN(conn)->cpath_layer);
-
-    /* start by finding a rendezvous circuit for us */
-
-    retval = circuit_get_open_circ_or_launch(
-       conn, CIRCUIT_PURPOSE_C_REND_JOINED, &rendcirc);
-    if (retval < 0) return -1; /* failed */
-
-    if (retval > 0) {
-      tor_assert(rendcirc);
-      /* one is already established, attach */
-      log_info(LD_REND,
-               "rend joined circ %u (id: %" PRIu32 ") already here. "
-               "Attaching. (stream %d sec old)",
-               (unsigned) TO_CIRCUIT(rendcirc)->n_circ_id,
-               rendcirc->global_identifier, conn_age);
-      /* Mark rendezvous circuits as 'newly dirty' every time you use
-       * them, since the process of rebuilding a rendezvous circ is so
-       * expensive. There is a tradeoff between linkability and
-       * feasibility, at this point.
-       */
-      rendcirc->base_.timestamp_dirty = time(NULL);
-
-      /* We've also attempted to use them. If they fail, we need to
-       * probe them for path bias */
-      pathbias_count_use_attempt(rendcirc);
-
-      link_apconn_to_circ(conn, rendcirc, NULL);
-      if (connection_ap_handshake_send_begin(conn) < 0)
-        return 0; /* already marked, let them fade away */
-      return 1;
-    }
-
-    /* At this point we need to re-check the state, since it's possible that
-     * our call to circuit_get_open_circ_or_launch() changed the connection's
-     * state from "CIRCUIT_WAIT" to "RENDDESC_WAIT" because we decided to
-     * re-fetch the descriptor.
-     */
-    if (ENTRY_TO_CONN(conn)->state != AP_CONN_STATE_CIRCUIT_WAIT) {
-      log_info(LD_REND, "This connection is no longer ready to attach; its "
-               "state changed."
-               "(We probably have to re-fetch its descriptor.)");
-      return 0;
-    }
-
-    if (rendcirc && (rendcirc->base_.purpose ==
-                     CIRCUIT_PURPOSE_C_REND_READY_INTRO_ACKED)) {
-      log_info(LD_REND,
-               "pending-join circ %u (id: %" PRIu32 ") already here, with "
-               "intro ack. Stalling. (stream %d sec old)",
-               (unsigned) TO_CIRCUIT(rendcirc)->n_circ_id,
-               rendcirc->global_identifier, conn_age);
-      return 0;
-    }
-
-    /* it's on its way. find an intro circ. */
-    retval = circuit_get_open_circ_or_launch(
-      conn, CIRCUIT_PURPOSE_C_INTRODUCE_ACK_WAIT, &introcirc);
-    if (retval < 0) return -1; /* failed */
-
-    if (retval > 0) {
-      /* one has already sent the intro. keep waiting. */
-      tor_assert(introcirc);
-      log_info(LD_REND, "Intro circ %u (id: %" PRIu32 ") present and "
-                        "awaiting ACK. Rend circuit %u (id: %" PRIu32 "). "
-                        "Stalling. (stream %d sec old)",
-               (unsigned) TO_CIRCUIT(introcirc)->n_circ_id,
-               introcirc->global_identifier,
-               rendcirc ? (unsigned) TO_CIRCUIT(rendcirc)->n_circ_id : 0,
-               rendcirc ? rendcirc->global_identifier : 0,
-               conn_age);
-      return 0;
-    }
-
-    /* now rendcirc and introcirc are each either undefined or not finished */
-
-    if (rendcirc && introcirc &&
-        rendcirc->base_.purpose == CIRCUIT_PURPOSE_C_REND_READY) {
-      log_info(LD_REND,
-               "ready rend circ %u (id: %" PRIu32 ") already here. No"
-               "intro-ack yet on intro %u (id: %" PRIu32 "). "
-               "(stream %d sec old)",
-               (unsigned) TO_CIRCUIT(rendcirc)->n_circ_id,
-               rendcirc->global_identifier,
-               (unsigned) TO_CIRCUIT(introcirc)->n_circ_id,
-               introcirc->global_identifier, conn_age);
-
-      tor_assert(introcirc->base_.purpose == CIRCUIT_PURPOSE_C_INTRODUCING);
-      if (introcirc->base_.state == CIRCUIT_STATE_OPEN) {
-        int ret;
-        log_info(LD_REND, "Found open intro circ %u (id: %" PRIu32 "). "
-                          "Rend circuit %u (id: %" PRIu32 "); Sending "
-                          "introduction. (stream %d sec old)",
-                 (unsigned) TO_CIRCUIT(introcirc)->n_circ_id,
-                 introcirc->global_identifier,
-                 (unsigned) TO_CIRCUIT(rendcirc)->n_circ_id,
-                 rendcirc->global_identifier, conn_age);
-        ret = hs_client_send_introduce1(introcirc, rendcirc);
-        switch (ret) {
-        case 0: /* success */
-          rendcirc->base_.timestamp_dirty = time(NULL);
-          introcirc->base_.timestamp_dirty = time(NULL);
-
-          pathbias_count_use_attempt(introcirc);
-          pathbias_count_use_attempt(rendcirc);
-
-          assert_circuit_ok(TO_CIRCUIT(rendcirc));
-          assert_circuit_ok(TO_CIRCUIT(introcirc));
-          return 0;
-        case -1: /* transient error */
-          return 0;
-        case -2: /* permanent error */
-          return -1;
-        default: /* oops */
-          tor_fragile_assert();
-          return -1;
-        }
-      }
-    }
-
-    log_info(LD_REND, "Intro %u (id: %" PRIu32 ") and rend circuit %u "
-                      "(id: %" PRIu32 ") circuits are not both ready. "
-                      "Stalling conn. (%d sec old)",
-             introcirc ? (unsigned) TO_CIRCUIT(introcirc)->n_circ_id : 0,
-             introcirc ? introcirc->global_identifier : 0,
-             rendcirc ? (unsigned) TO_CIRCUIT(rendcirc)->n_circ_id : 0,
-             rendcirc ? rendcirc->global_identifier : 0, conn_age);
-    return 0;
-  }
+  /* Mark for close if unattached */
+  if(retval < 0 && !conn->marked_for_close)
+    connection_mark_unattached_ap(conn, END_STREAM_REASON_CANT_ATTACH);
+  return retval;
 }
 
 /** Change <b>circ</b>'s purpose to <b>new_purpose</b>. */
