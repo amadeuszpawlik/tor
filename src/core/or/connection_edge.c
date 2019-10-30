@@ -1275,11 +1275,7 @@ connection_ap_attach_pending(int retry)
     }
 
     /* Okay, we're through the sanity checks. Try to handle this stream. */
-    if (connection_ap_handshake_attach_circuit(entry_conn) < 0) {
-      if (!conn->marked_for_close)
-        connection_mark_unattached_ap(entry_conn,
-                                      END_STREAM_REASON_CANT_ATTACH);
-    }
+    connection_ap_handshake_attach_circuit(entry_conn);
 
     if (! conn->marked_for_close &&
         conn->type == CONN_TYPE_AP &&
